@@ -12,9 +12,9 @@ from Bio import SeqIO
 from Bio.Blast import NCBIXML
 
 
-class _Primer(namedtuple('_Primer', 'p_idx, left, right, gc, length')):
-    def __new__(cls, p_idx, left, right, gc, length):
-        return super(_Primer, cls).__new__(cls, int(p_idx), left, right, float(gc), int(length))
+class _Primer(namedtuple('_Primer', 'p_idx, left, right, length, gc, tm')):
+    def __new__(cls, p_idx, left, right, length, gc, tm):
+        return super(_Primer, cls).__new__(cls, int(p_idx), left, right, int(length), float(gc), float(tm))
 
     @classmethod
     def columns(cls):
@@ -109,6 +109,15 @@ class _AssemblyProtocol:
         return self._primer3_ssrs
 
     #
+    @staticmethod
+    def merge_ssrs(assembly_objs, filename):
+        # Just concatenate content of Primer3 files
+        with open(filename, 'wb') as wfd:
+            for ao in assembly_objs:
+                with open(ao.get_ssrs_filename_for_merging(), 'rb') as fd:
+                    shutil.copyfileobj(fd, wfd)
+
+    #
     def store_aplified_primers(self, ampl_res):
         self.project.write_csv(self.amplify_primers_csv, [[a] for a in ampl_res], ['primer_idx'])
         self._amplified_primers = set(ampl_res)
@@ -135,13 +144,14 @@ class _Assembly_RM_Primer3(_AssemblyProtocol):
         self.primer3_dir = os.path.join(assembly_dir, '3_Primer3')
         super().__init__(project, assembly_idx, assembly_file, assembly_dir)
 
-    @staticmethod
-    def merge_ssrs(assembly_objs, filename):
-        # Just concatenate content of Primer3 files
-        with open(filename, 'wb') as wfd:
-            for ao in assembly_objs:
-                with open(ao.primer3_primers_csv, 'rb') as fd:
-                    shutil.copyfileobj(fd, wfd)
+    def get_ssrs_for_repeat_masker(self):
+        return self.get_misa_ssrs()
+
+    def get_ssrs_for_primer3(self):
+        return self.get_rm_ssrs()
+
+    def get_ssrs_filename_for_merging(self):
+        return self.primer3_primers_csv
 
 
 class _Assembly_Primer3_RM(_AssemblyProtocol):
@@ -150,9 +160,18 @@ class _Assembly_Primer3_RM(_AssemblyProtocol):
         self.rm_dir = os.path.join(assembly_dir, '3_RepeatMasker')
         super().__init__(project, assembly_idx, assembly_file, assembly_dir)
 
-    @staticmethod
-    def merge_ssrs(assembly_objs, filename):
-        assert False, 'ToDo'
+    def get_ssrs_for_primer3(self):
+        return self.get_misa_ssrs()
+
+    def get_ssrs_for_repeat_masker(self):
+        return self.get_primer_ssrs()
+
+    def store_rm_ssrs(self, rm_ssrs):
+        self._rm_ssrs = rm_ssrs
+        self.project.write_primers(self.rm_ssrs_csv, rm_ssrs)
+
+    def get_ssrs_filename_for_merging(self):
+        return self.rm_ssrs_csv
 
 
 #
@@ -163,7 +182,7 @@ class _Project:
 
     def __init__(self, params):
         self.params = params
-        self.assembly_cls = _Assembly_RM_Primer3
+        self.assembly_cls = _Assembly_RM_Primer3 if params.get('workflow', 'rp') == 'rp' else _Assembly_Primer3_RM
         self._merged_primers = None
         # MISA
         misa_repeats = params['misa_repeats'].split(',')
@@ -208,29 +227,6 @@ class _Project:
         return ssrs
 
     #
-    def finalize(self):
-        if len(self.assembly_objs) == 1:
-            primers = self.assembly_objs[0].get_aplified_primers()
-        else:
-            primers = set.intersection(*self.assembly_objs.get_aplified_primers())
-        #
-        assembly_primers = defaultdict(list)
-        for p_idx in primers:
-            assembly_primers[p_idx.split('_', 1)[0]].append(p_idx)
-        final_primers = []
-        for assembly_idx, a_primers in assembly_primers.items():
-            a_data = self.assembly_objs[int(assembly_idx)]
-            a_ssrs = dict((ssr.ssr_idx, ssr) for ssr in a_data.get_primer_ssrs())
-            for p_idx in a_primers:
-                ssr_idx, prime_index = p_idx.rsplit('_', 1)
-                ssr = a_ssrs[ssr_idx]
-                # print(p_idx, ssr)
-                # final_primers.append((score, p_idx))
-
-        # # Extract data
-        # self._final_primers_csv
-
-    #
     def delete_from(self, delete_from):
         # No more than 9 steps :-)
         for f in [self._merged_primers_csv, self._final_primers_csv]:
@@ -247,8 +243,7 @@ class _Project:
 
     #
     def _exe_prog(self, cmd, cwd):
-        print('Executing:', ' '.join(cmd))
-        print('  working dir:', cwd)
+        print(f"Executing: ' '.join(cmd)\n  Working dir: {cwd}")
         subprocess.run(cmd, cwd=cwd)
 
     def ensure_dir(self, _dir):
@@ -359,9 +354,9 @@ def _misa(a_data, proj):
         cleaned_ssrs[_id] = [ssr for idx, ssr in enumerate(ssrs) if idx not in to_remove]
 
     # Store SSRs in CSV file
-    output_ssrs = list(chain(*cleaned_ssrs.values()))
-    if proj.params['misa_max_ssrs']:
-        output_ssrs = output_ssrs[:proj.params['misa_max_ssrs']]
+    output_ssrs = list(chain(*(v for _, v in sorted(cleaned_ssrs.items()))))
+    if mms := proj.params.get('misa_max_ssrs'):
+        output_ssrs = output_ssrs[:mms]
     num_before_store = len(output_ssrs)
     output_ssrs = a_data.store_misa_ssrs(output_ssrs)
 
@@ -384,25 +379,47 @@ def _repeat_masker(a_data, proj):
     if os.path.isfile(a_data.rm_ssrs_csv):
         return
 
-    misa_ssrs = dict((sn.ssr_idx, sn) for sn in a_data.get_misa_ssrs())
+    ssrs = dict((sn.ssr_idx, sn) for sn in a_data.get_ssrs_for_repeat_masker())
 
     # Input file for RepeatMasker
     proj.ensure_dir(a_data.rm_dir)
     query_fa = os.path.join(a_data.rm_dir, 'query.fa')
     with open(query_fa, 'w') as _query:
-        for sn in misa_ssrs.values():
+        for sn in ssrs.values():
             _query.write(f'>{sn.ssr_idx}\n')
             _query.write(f'{sn.seq_part}\n')
 
     # Call RepeatMasker
+
     if not os.path.isfile(query_fa + '.masked'):
-        proj._exe_prog(['RepeatMasker', 'query.fa'], a_data.rm_dir)
+        cmd = ['RepeatMasker', 'query.fa']
+        if (_nt := proj.params.get('num_threads', 1)) > 1:
+            # -pa(rallel) [number]
+            #     The number of sequence batch jobs [50kb minimum] to run in parallel.
+            #     RepeatMasker will fork off this number of parallel jobs, each
+            #     running the search engine specified. For each search engine
+            #     invocation ( where applicable ) a fixed the number of cores/threads
+            #     is used:
+            #       RMBlast     4 cores
+            #       ABBlast     4 cores
+            #       nhmmer      2 cores
+            #       crossmatch  1 core
+            #     To estimate the number of cores a RepeatMasker run will use simply
+            #     multiply the -pa value by the number of cores the particular search
+            #     engine will use.
+            # For now suppose nhmmer
+            # ToDo: add an argument
+            _nt = _nt // 2
+            if _nt > 1:
+                cmd.extend(['-pa', str(_nt)])
+
+        proj._exe_prog(cmd, a_data.rm_dir)
 
     # Process ouput
     max_repeat_diff = proj.params['max_repeat_diff']
     rm_ssrs = []
     for sec_record in SeqIO.parse(query_fa + '.masked', 'fasta'):
-        sn = misa_ssrs[sec_record.id]
+        sn = ssrs[sec_record.id]
         num_diff = sum(1 for a, b in zip(sn.seq_part, str(sec_record.seq)) if a != b)
         diff_between = num_diff - len(sn.motif) * sn.repeats
         if diff_between <= max_repeat_diff:
@@ -412,7 +429,7 @@ def _repeat_masker(a_data, proj):
     a_data.store_rm_ssrs(rm_ssrs)
     proj.write_text(os.path.join(a_data.rm_dir, 'report.txt'), f"""REPORT
 
-Input SSRs       : {len(misa_ssrs)}
+Input SSRs       : {len(ssrs)}
 Good SSRs        : {len(rm_ssrs)}
 """)
 
@@ -451,7 +468,7 @@ def _primer3(a_data, proj):
     if os.path.isfile(a_data.primer3_primers_csv):
         return
 
-    ssrs = dict((sn.ssr_idx, sn) for sn in a_data.get_rm_ssrs())
+    ssrs = dict((sn.ssr_idx, sn) for sn in a_data.get_ssrs_for_primer3())
 
     # Write input file
     proj.ensure_dir(a_data.primer3_dir)
@@ -492,8 +509,9 @@ def _primer3(a_data, proj):
                             p_idx,
                             seq_data[f'PRIMER_LEFT_{p_idx}_SEQUENCE'],
                             seq_data[f'PRIMER_RIGHT_{p_idx}_SEQUENCE'],
+                            seq_data[f'PRIMER_PAIR_{p_idx}_PRODUCT_SIZE'],
                             seq_data[f'PRIMER_INTERNAL_{p_idx}_GC_PERCENT'],
-                            seq_data[f'PRIMER_PAIR_{p_idx}_PRODUCT_SIZE']))
+                            seq_data[f'PRIMER_INTERNAL_{p_idx}_TM']))
                 #
                 seq_data = dict()
             else:
@@ -532,8 +550,10 @@ def _amplify(a_data, proj):
 
         cmd = ['blastn', '-db', a_data.get_blast_db(), '-query', 'query.fa', '-outfmt', '5', '-out', 'results.xml',
                '-task', 'blastn-short', '-perc_identity', '100', '-evalue', '1e-1']
+        if (_nt := proj.params.get('num_threads', 1)) > 1:
+            cmd.extend(['-num_threads', str(_nt)])
         # '-dust', 'no', '-soft_masking', 'false']
-        # -num_threads, -num_alignments, -max_target_seqs, -no_greedy, -ungapped
+        # , -num_alignments, -max_target_seqs, -no_greedy, -ungapped
         # evalue=1e-1 filters sequences shorter than 15char. I hope :-)
         # ToDo: izracunati ga?
         # E = m x n  / 2^bit-score
@@ -584,7 +604,6 @@ def _amplify(a_data, proj):
                             amplifications += 1
                             if amplifications > 1:
                                 more_aplifications += 1
-                                print(primer_idx, 'vise')
                                 break
                             ampl_length = dist
                 if amplifications > 1:
@@ -608,6 +627,68 @@ Zero amplifications : {zero_aplifications}
 
 
 # -------------------------------------------------------------------
+# Finilize
+# -------------------------------------------------------------------
+def _finalize(proj):
+    if os.path.isfile(proj._final_primers_csv):
+        return
+
+    # Collect set of primer idxs
+    if len(proj.assembly_objs) == 1:
+        primers = proj.assembly_objs[0].get_aplified_primers()
+    else:
+        primers = set.intersection(*proj.assembly_objs.get_aplified_primers())
+
+    # Score methods
+    _center = lambda x, c, r: abs(x - c) / r
+    _mehtods = []
+    if pp_len := proj.params['prefer_primer_length']:
+        _mehtods.append(lambda primer, _: _center(len(primer.left), *pp_len) + _center(len(primer.right), *pp_len))
+    if pp_idx := proj.params['prefer_primer_idx']:
+        _mehtods.append(lambda _, primer_idx: _center(primer_idx, *pp_idx))
+    if p_gc := proj.params['prefer_gc']:
+        _mehtods.append(lambda primer, _: _center(primer.gc, *p_gc))
+    if p_tm := proj.params['prefer_tm']:
+        _mehtods.append(lambda primer, _: _center(primer.tm, *p_tm))
+
+    if _mehtods:
+        def _calc_score(primer, prime_index):  # Less is better
+            # int(s*100) removes digits, precision is futile :-)
+            scores = [int(100 * m(primer, prime_index)) for m in _mehtods]
+            return sum(scores), max(scores)
+    else:
+        def _calc_score(primer, prime_index):
+            return 0, 0
+
+    # Collect data
+    final_primers = []
+    current_assembly = None
+    last_ssr_idx = None
+    for p_idx in sorted(primers):  # Assemblies are sorted, and primers should be sorted if less than 10 are used :-)
+        ssr_idx, primer_index = p_idx.rsplit('_', 1)
+        if last_ssr_idx == ssr_idx:  # SSR already processed
+            continue
+        last_ssr_idx = ssr_idx
+        primer_index = int(primer_index)
+        assembly_idx = ssr_idx.split('_', 1)[0]
+        #
+        if assembly_idx != current_assembly:
+            current_assembly = assembly_idx
+            a_data = proj.assembly_objs[int(assembly_idx)]
+            a_ssrs = dict((ssr.ssr_idx, ssr) for ssr in a_data.get_primer_ssrs())
+        #
+        ssr = a_ssrs[ssr_idx]
+        primer = ssr.primers[primer_index]
+        final_primers.append((_calc_score(primer, primer_index), ssr, primer, primer_index))
+
+    # Sort results by the score
+    final_primers.sort()
+    proj.write_csv(proj._final_primers_csv,
+                   [ssr[:-2] + primer + score + (primer_index,) for score, ssr, primer, primer_index in final_primers],
+                   _SSR.columns()[:-1] + primer.columns() + ('score', 'max_score', 'primer_index'))
+
+
+# -------------------------------------------------------------------
 # Workflow
 # -------------------------------------------------------------------
 def find_params(params):
@@ -620,9 +701,10 @@ def find_params(params):
         # ToDo: check data?
         assert params.assembly
         settings = dict(assemblies=[os.path.abspath(a) for a in params.assembly],
+                        workflow=params.workflow,
+                        misa_max_ssrs=params.misa_max_ssrs,
                         space_around=params.space_around,
                         misa_repeats=params.misa_repeats,
-                        misa_max_ssrs=params.misa_max_ssrs,
                         max_repeat_diff=params.max_repeat_diff,
                         product_size_range=params.product_size_range,
                         min_size=params.min_size, max_size=params.max_size,
@@ -641,6 +723,8 @@ def find_params(params):
             json.dump(settings, _out, indent=4)
         #
         os.chdir(params.working_dir)
+    #
+    settings['num_threads'] = params.num_threads
     return settings
 
 
@@ -661,28 +745,38 @@ def process_project(params, delete_from=None):
     if not os.path.isfile(proj._merged_primers_csv):
         for a_data in proj.assembly_objs:
             _misa(a_data, proj)
-            _repeat_masker(a_data, proj)
-            _primer3(a_data, proj)
+            if proj.params['workflow'] == 'rp':
+                _repeat_masker(a_data, proj)
+                _primer3(a_data, proj)
+            else:
+                _primer3(a_data, proj)
+                _repeat_masker(a_data, proj)
 
         proj.merge_ssrs()
 
     for a_data in proj.assembly_objs:
         _amplify(a_data, proj)
 
-    proj.finalize()
+    _finalize(proj)
 
 
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser(description="""Finds SSRs primers. Works on one or more assemblies of releate species.""")
+    parser = argparse.ArgumentParser(
+        description="""Finds SSRs primers. Works on one or more assemblies of releate species.""")
 
     #
     parser.add_argument(
         '-D', '--delete-from', type=int, help="Delete project's data from given step.")
+    parser.add_argument(
+        '-T', '--num-threads', default=1, type=int, help="Number of threads to use")
 
     #
     parser.add_argument(
         '-w', '--working-dir', default='.', help="Project's directory. All data will be stored in this directory.")
+    parser.add_argument(
+        '-W', '--workflow', default='bp', choices=('rp', 'pr'),
+        help="Workflow to use. RepeatMasker -> Primer3 or Primer3 -> RepeatMasker")
 
     # Assembly data
     parser.add_argument('-a', '--assembly', action='append', help='Assembly')
