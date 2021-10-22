@@ -8,6 +8,7 @@ import subprocess
 from collections import namedtuple, defaultdict
 from types import SimpleNamespace
 from itertools import chain, product
+from concurrent.futures import ThreadPoolExecutor
 from Bio import SeqIO
 from Bio.Blast import NCBIXML
 
@@ -184,6 +185,7 @@ class _Project:
         self.params = params
         self.assembly_cls = _Assembly_RM_Primer3 if params.get('workflow', 'rp') == 'rp' else _Assembly_Primer3_RM
         self._merged_primers = None
+        self.num_threads = params.get('num_threads', 1)
         # MISA
         misa_repeats = params['misa_repeats'].split(',')
         self.used_repeats = [int(r.split('-')[0]) for r in misa_repeats]
@@ -243,7 +245,7 @@ class _Project:
 
     #
     def _exe_prog(self, cmd, cwd):
-        print(f"Executing: ' '.join(cmd)\n  Working dir: {cwd}")
+        print(f"Executing: {' '.join(cmd)}  (cwd: {cwd})")
         subprocess.run(cmd, cwd=cwd)
 
     def ensure_dir(self, _dir):
@@ -393,7 +395,7 @@ def _repeat_masker(a_data, proj):
 
     if not os.path.isfile(query_fa + '.masked'):
         cmd = ['RepeatMasker', 'query.fa']
-        if (_nt := proj.params.get('num_threads', 1)) > 1:
+        if proj.num_threads > 1:
             # -pa(rallel) [number]
             #     The number of sequence batch jobs [50kb minimum] to run in parallel.
             #     RepeatMasker will fork off this number of parallel jobs, each
@@ -409,8 +411,7 @@ def _repeat_masker(a_data, proj):
             #     engine will use.
             # For now suppose nhmmer
             # ToDo: add an argument
-            _nt = _nt // 2
-            if _nt > 1:
+            if (_nt := proj.num_threads // 2) > 1:
                 cmd.extend(['-pa', str(_nt)])
 
         proj._exe_prog(cmd, a_data.rm_dir)
@@ -464,23 +465,29 @@ PRIMER_EXPLAIN_FLAG=1
 """
 
 
+def _exec_primer3(a_data, proj, ssrs, input_f, output_f, error_f):
+    num_around = 10
+    na_2 = 2 * num_around
+    target = proj.params['space_around'] + 1 - num_around
+    with open(os.path.join(a_data.primer3_dir, input_f), 'w') as _out:
+        for sn in ssrs:
+            _out.write(_sequence_params.format(
+                seq_id=sn.ssr_idx, seq=sn.seq_part, target=f"{target},{len(sn.motif) * sn.repeats + na_2}"))
+
+    # Execute command
+    # ToDo: max returned, default is 5
+    proj._exe_prog(['primer3_core', '--p3_settings_file=primer3.set', '--strict_tags',
+                    f'--output={output_f}', f'--error={error_f}', input_f], a_data.primer3_dir)
+
+
 def _primer3(a_data, proj):
     if os.path.isfile(a_data.primer3_primers_csv):
         return
 
     ssrs = dict((sn.ssr_idx, sn) for sn in a_data.get_ssrs_for_primer3())
 
-    # Write input file
-    proj.ensure_dir(a_data.primer3_dir)
-    num_around = 10
-    na_2 = 2 * num_around
-    target = proj.params['space_around'] + 1 - num_around
-    with open(os.path.join(a_data.primer3_dir, 'primer3.input'), 'w') as _out:
-        for sn in ssrs.values():
-            _out.write(_sequence_params.format(
-                seq_id=sn.ssr_idx, seq=sn.seq_part, target=f"{target},{len(sn.motif) * sn.repeats + na_2}"))
-
     # Write settings file
+    proj.ensure_dir(a_data.primer3_dir)
     with open(os.path.join(a_data.primer3_dir, 'primer3.set'), 'w') as _out:
         _out.write(_primer_params.format(
             min_size=proj.params['min_size'], max_size=proj.params['max_size'],
@@ -489,34 +496,44 @@ def _primer3(a_data, proj):
             max_poly_x=proj.params['max_poly_x'],
             product_size_range=proj.params['product_size_range']))
 
-    # Execute command
-    # ToDo: max returned, default is 5
-    proj._exe_prog(['primer3_core', '--p3_settings_file=primer3.set', '--strict_tags',
-                    '--output=primer3.output', '--error=primer3.error', 'primer3.input'], a_data.primer3_dir)
+    # Write input file
+    output_files = []
+    if proj.num_threads == 1:
+        _exec_primer3(a_data, proj, ssrs.values(), 'primer3.input', 'primer3.output', 'primer3.error')
+        output_files.append('primer3.output')
+    else:
+        with ThreadPoolExecutor(max_workers=proj.num_threads) as executor:
+            l_ssrs = list(ssrs.values())
+            k, m = divmod(len(l_ssrs), proj.num_threads)
+            for i in range(proj.num_threads):
+                output_files.append(f'primer3_{i}.output')
+                executor.submit(_exec_primer3, a_data, proj, l_ssrs[i * k + min(i, m):(i + 1) * k + min(i + 1, m)],
+                                f'primer3_{i}.input', output_files[-1], f'primer3_{i}.error')
 
     # Process output
     num_primers = 0
-    with open(os.path.join(a_data.primer3_dir, 'primer3.output'), 'r') as _in:
-        seq_data = dict()
-        for line in _in:
-            line = line.strip()
-            if line == '=':
-                if num := int(seq_data['PRIMER_PAIR_NUM_RETURNED']):
-                    ssr_idx = seq_data['SEQUENCE_ID']
-                    for p_idx in range(num):
-                        num_primers += 1
-                        ssrs[ssr_idx].primers.append(_Primer(
-                            p_idx,
-                            seq_data[f'PRIMER_LEFT_{p_idx}_SEQUENCE'],
-                            seq_data[f'PRIMER_RIGHT_{p_idx}_SEQUENCE'],
-                            seq_data[f'PRIMER_PAIR_{p_idx}_PRODUCT_SIZE'],
-                            seq_data[f'PRIMER_INTERNAL_{p_idx}_GC_PERCENT'],
-                            seq_data[f'PRIMER_INTERNAL_{p_idx}_TM']))
-                #
-                seq_data = dict()
-            else:
-                key, value = line.split('=', 1)
-                seq_data[key] = value
+    for o_file in output_files:
+        with open(os.path.join(a_data.primer3_dir, o_file), 'r') as _in:
+            seq_data = dict()
+            for line in _in:
+                line = line.strip()
+                if line == '=':
+                    if num := int(seq_data['PRIMER_PAIR_NUM_RETURNED']):
+                        ssr_idx = seq_data['SEQUENCE_ID']
+                        for p_idx in range(num):
+                            num_primers += 1
+                            ssrs[ssr_idx].primers.append(_Primer(
+                                p_idx,
+                                seq_data[f'PRIMER_LEFT_{p_idx}_SEQUENCE'],
+                                seq_data[f'PRIMER_RIGHT_{p_idx}_SEQUENCE'],
+                                seq_data[f'PRIMER_PAIR_{p_idx}_PRODUCT_SIZE'],
+                                seq_data[f'PRIMER_INTERNAL_{p_idx}_GC_PERCENT'],
+                                seq_data[f'PRIMER_INTERNAL_{p_idx}_TM']))
+                    #
+                    seq_data = dict()
+                else:
+                    key, value = line.split('=', 1)
+                    seq_data[key] = value
 
     # Store data
     num_input_ssr = len(ssrs)
@@ -550,8 +567,8 @@ def _amplify(a_data, proj):
 
         cmd = ['blastn', '-db', a_data.get_blast_db(), '-query', 'query.fa', '-outfmt', '5', '-out', 'results.xml',
                '-task', 'blastn-short', '-perc_identity', '100', '-evalue', '1e-1']
-        if (_nt := proj.params.get('num_threads', 1)) > 1:
-            cmd.extend(['-num_threads', str(_nt)])
+        if proj.num_threads > 1:
+            cmd.extend(['-num_threads', str(proj.num_threads)])
         # '-dust', 'no', '-soft_masking', 'false']
         # , -num_alignments, -max_target_seqs, -no_greedy, -ungapped
         # evalue=1e-1 filters sequences shorter than 15char. I hope :-)
@@ -775,7 +792,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '-w', '--working-dir', default='.', help="Project's directory. All data will be stored in this directory.")
     parser.add_argument(
-        '-W', '--workflow', default='bp', choices=('rp', 'pr'),
+        '-W', '--workflow', default='pr', choices=('rp', 'pr'),
         help="Workflow to use. RepeatMasker -> Primer3 or Primer3 -> RepeatMasker")
 
     # Assembly data
