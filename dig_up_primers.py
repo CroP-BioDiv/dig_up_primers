@@ -44,13 +44,13 @@ class _AssemblyProtocol:
         self.assembly_idx = assembly_idx
         self.assembly_file = assembly_file
         self.assembly_dir = assembly_dir
-        self.misa_dir = os.path.join(assembly_dir, '1_MISA')
+        self.misa_dir = os.path.join('1_MISA', assembly_dir)
         self.misa_ssrs_csv = os.path.join(self.misa_dir, 'ssrs.csv')
         self.rm_ssrs_csv = os.path.join(self.rm_dir, 'ssrs.csv')
         self.primer3_primers_csv = os.path.join(self.primer3_dir, 'primers.csv')
-        self.amplify_dir = os.path.join(assembly_dir, '5_amplify')
+        self.amplify_dir = os.path.join('5_amplify', assembly_dir)
         self.amplify_primers_csv = os.path.join(self.amplify_dir, 'primers.csv')
-        self.blast_db_dir = os.path.join(assembly_dir, 'BlastDB')
+        self.blast_db_dir = os.path.join('BlastDB', assembly_dir, )
         #
         self._misa_ssrs = None
         self._rm_ssrs = None
@@ -141,8 +141,8 @@ class _AssemblyProtocol:
 
 class _Assembly_RM_Primer3(_AssemblyProtocol):
     def __init__(self, project, assembly_idx, assembly_file, assembly_dir):
-        self.rm_dir = os.path.join(assembly_dir, '2_RepeatMasker')
-        self.primer3_dir = os.path.join(assembly_dir, '3_Primer3')
+        self.rm_dir = os.path.join('2_RepeatMasker', assembly_dir)
+        self.primer3_dir = os.path.join('3_Primer3', assembly_dir)
         super().__init__(project, assembly_idx, assembly_file, assembly_dir)
 
     def get_ssrs_for_repeat_masker(self):
@@ -157,8 +157,8 @@ class _Assembly_RM_Primer3(_AssemblyProtocol):
 
 class _Assembly_Primer3_RM(_AssemblyProtocol):
     def __init__(self, project, assembly_idx, assembly_file, assembly_dir):
-        self.primer3_dir = os.path.join(assembly_dir, '2_Primer3')
-        self.rm_dir = os.path.join(assembly_dir, '3_RepeatMasker')
+        self.primer3_dir = os.path.join('2_Primer3', assembly_dir)
+        self.rm_dir = os.path.join('3_RepeatMasker', assembly_dir)
         super().__init__(project, assembly_idx, assembly_file, assembly_dir)
 
     def get_ssrs_for_primer3(self):
@@ -218,7 +218,7 @@ class _Project:
         pls = self._primer_line_start
         ssrs = []
         with open(csv_filename, 'r') as _csv:
-            next(_csv)  # Skip heade
+            next(_csv)  # Skip header
             next(_csv)
             for line in _csv:
                 fields = line.strip().split(';')
@@ -270,27 +270,10 @@ class _Project:
 # -------------------------------------------------------------------
 # MISA
 # -------------------------------------------------------------------
-# Uses misa.pl to filter sequences with SSRs
-#
-# Misa outputs results in two files, both named by adding suffix on input filename.
-#  - <input_filename>.misa       : results
-#  - <input_filename>.statistics : stats
-#
-# To keep all misa files in working directory, symbolic link is created to input fasta file and misa is run on it.
-#
-# Files in working directory:
-#  - input.fa            : symbolic link to input fasta file
-#  - misa.ini            : search parameters
-#  - input.fa.misa       : misa output file
-#  - input.fa.statistics : misa stats
-#  - ssrs.csv            : csv with data for reads to use for assemble
-#
-# Misa output is of format
-# ID      SSR nr. SSR type        SSR     size    start   end
-#
 _misa_ini = """
-definition(unit_size,min_repeats):                   {repeats}
-interruptions(max_difference_between_2_SSRs):        {max_difference}
+definition(unit_size,min_repeats):             {repeats}
+interruptions(max_difference_between_2_SSRs):  1
+GFF:                                           false
 """
 _misa_ssr = re.compile(r'^\(([ATCG]+)\)([0-9]+)$')
 
@@ -310,15 +293,15 @@ def _misa(a_data, proj):
             os.symlink(a_data.assembly_file, i_f)
 
         with open(os.path.join(a_data.misa_dir, 'misa.ini'), 'w') as out:
-            out.write(_misa_ini.format(repeats=proj.misa_repeats, max_difference=1))
+            out.write(_misa_ini.format(repeats=proj.misa_repeats))
 
         proj._exe_prog(['misa.pl', 'input.fa'], a_data.misa_dir)
 
     # Filter only simple SSRs
-    id_2_ssrs = dict()  # id -> list of SSRs
+    id_2_ssrs = defaultdict(list)  # id -> list of SSRs
     num_misa_ssrs = 0
     num_composite = 0
-    num_motif_1 = 0
+    num_motif_1 = 0  # Note: newer version take care about shorter
     with open(misa_result_filename, 'r') as _misa:
         header = next(_misa)
         for line in _misa:
@@ -336,8 +319,6 @@ def _misa(a_data, proj):
                 num_motif_1 += 1
                 continue
             #
-            if _id not in id_2_ssrs:
-                id_2_ssrs[_id] = []
             id_2_ssrs[_id].append((_id, int(start), int(end), _s, int(_rep)))
 
     # Remove SSRs that are close
@@ -345,24 +326,22 @@ def _misa(a_data, proj):
     num_close = 0
     space_around = proj.params['space_around']
     for _id, ssrs in id_2_ssrs.items():
-        ssrs.sort()  # Inline sort
-        to_remove = set()
-        for idx, ssr2 in enumerate(ssrs[1:]):
-            ssr1 = ssrs[idx]
-            if ssr2[1] - ssr1[2] <= space_around:
-                to_remove.add(idx)
-                to_remove.add(idx + 1)
+        ssrs.sort()  # Inline sort. Note: newer MISA version take a care about sorting!
+        to_remove = set(chain.from_iterable((idx, idx + 1) for idx, ssr2 in enumerate(ssrs[1:])
+                                            if ssr2[1] - ssrs[idx][2] <= space_around))
         num_close += len(to_remove)
         cleaned_ssrs[_id] = [ssr for idx, ssr in enumerate(ssrs) if idx not in to_remove]
 
     # Store SSRs in CSV file
     output_ssrs = list(chain(*(v for _, v in sorted(cleaned_ssrs.items()))))
+    if sml := proj.params['ssr_max_length']:
+        output_ssrs = [ssr for ssr in output_ssrs if len(ssr[3]) * ssr[4] <= sml]
     if mms := proj.params.get('misa_max_ssrs'):
         output_ssrs = output_ssrs[:mms]
     num_before_store = len(output_ssrs)
     output_ssrs = a_data.store_misa_ssrs(output_ssrs)
 
-    motif_1 = f'SSRs of motif with 1 : {num_motif_1}\n' if 1 not in proj.used_repeats else '\n'
+    motif_1 = f'SSRs of motif with 1  : {num_motif_1}\n' if 1 not in proj.used_repeats and num_motif_1 else ''
     proj.write_text(os.path.join(a_data.misa_dir, 'report.txt'), f"""REPORT
 
 SSRs found by MISA    : {num_misa_ssrs}
@@ -381,9 +360,8 @@ def _repeat_masker(a_data, proj):
     if os.path.isfile(a_data.rm_ssrs_csv):
         return
 
-    ssrs = dict((sn.ssr_idx, sn) for sn in a_data.get_ssrs_for_repeat_masker())
-
     # Input file for RepeatMasker
+    ssrs = dict((sn.ssr_idx, sn) for sn in a_data.get_ssrs_for_repeat_masker())
     proj.ensure_dir(a_data.rm_dir)
     query_fa = os.path.join(a_data.rm_dir, 'query.fa')
     with open(query_fa, 'w') as _query:
@@ -392,25 +370,10 @@ def _repeat_masker(a_data, proj):
             _query.write(f'{sn.seq_part}\n')
 
     # Call RepeatMasker
-
     if not os.path.isfile(query_fa + '.masked'):
         cmd = ['RepeatMasker', 'query.fa']
         if proj.num_threads > 1:
-            # -pa(rallel) [number]
-            #     The number of sequence batch jobs [50kb minimum] to run in parallel.
-            #     RepeatMasker will fork off this number of parallel jobs, each
-            #     running the search engine specified. For each search engine
-            #     invocation ( where applicable ) a fixed the number of cores/threads
-            #     is used:
-            #       RMBlast     4 cores
-            #       ABBlast     4 cores
-            #       nhmmer      2 cores
-            #       crossmatch  1 core
-            #     To estimate the number of cores a RepeatMasker run will use simply
-            #     multiply the -pa value by the number of cores the particular search
-            #     engine will use.
-            # For now suppose nhmmer
-            # ToDo: add an argument
+            # ToDo: add an argument. For now suppose nhmmer - 2 cores
             if (_nt := proj.num_threads // 2) > 1:
                 cmd.extend(['-pa', str(_nt)])
 
@@ -422,8 +385,7 @@ def _repeat_masker(a_data, proj):
     for sec_record in SeqIO.parse(query_fa + '.masked', 'fasta'):
         sn = ssrs[sec_record.id]
         num_diff = sum(1 for a, b in zip(sn.seq_part, str(sec_record.seq)) if a != b)
-        diff_between = num_diff - len(sn.motif) * sn.repeats
-        if diff_between <= max_repeat_diff:
+        if (num_diff - len(sn.motif) * sn.repeats) <= max_repeat_diff:
             rm_ssrs.append(sn)
 
     #
@@ -569,13 +531,9 @@ def _amplify(a_data, proj):
                '-task', 'blastn-short', '-perc_identity', '100', '-evalue', '1e-1']
         if proj.num_threads > 1:
             cmd.extend(['-num_threads', str(proj.num_threads)])
-        # '-dust', 'no', '-soft_masking', 'false']
-        # , -num_alignments, -max_target_seqs, -no_greedy, -ungapped
         # evalue=1e-1 filters sequences shorter than 15char. I hope :-)
-        # ToDo: izracunati ga?
-        # E = m x n  / 2^bit-score
-        #     m - query sequence length
-        #     n - total database length (sum of all sequences)
+        # ToDo: calculate evalue?
+        # E = m x n  / 2^(bit-score) ; m - query sequence length ; n - total database length (sum of all sequences)
         proj._exe_prog(cmd, a_data.amplify_dir)
 
     # Collect data from result file
@@ -722,6 +680,7 @@ def find_params(params):
                         misa_max_ssrs=params.misa_max_ssrs,
                         space_around=params.space_around,
                         misa_repeats=params.misa_repeats,
+                        ssr_max_length=params.ssr_max_length,
                         max_repeat_diff=params.max_repeat_diff,
                         product_size_range=params.product_size_range,
                         min_size=params.min_size, max_size=params.max_size,
@@ -792,8 +751,8 @@ if __name__ == '__main__':
     parser.add_argument(
         '-w', '--working-dir', default='.', help="Project's directory. All data will be stored in this directory.")
     parser.add_argument(
-        '-W', '--workflow', default='pr', choices=('rp', 'pr'),
-        help="Workflow to use. RepeatMasker -> Primer3 or Primer3 -> RepeatMasker")
+        '-W', '--workflow', default='pr', choices=('pr', 'rp'),
+        help="Workflow to use. Primer3 -> RepeatMasker or RepeatMasker -> Primer3")
 
     # Assembly data
     parser.add_argument('-a', '--assembly', action='append', help='Assembly')
@@ -807,6 +766,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '-m', '--misa-repeats', default='2-10,3-7',
         help='MISA min repeat definition. Simiar format as in MISA, except space is replaced with comma.')
+    parser.add_argument('--ssr-max-length', default=80, type=int, help='Limit SSR length')
     parser.add_argument('--misa-max-ssrs', type=int, help='Limit number of SSRs MISA outputs. For testing.')
 
     # RepeatMasker params
@@ -815,7 +775,7 @@ if __name__ == '__main__':
         help='How many bps can RepeatMasker repeat be longer than MISA repeat')
 
     # Primer3 params
-    parser.add_argument('--product-size-range', default='200-300', help="Primer3: PRIMER_PRODUCT_SIZE_RANGE")
+    parser.add_argument('--product-size-range', default='180-240', help="Primer3: PRIMER_PRODUCT_SIZE_RANGE")
     parser.add_argument('--min-size', type=int, default=19, help="Primer3: PRIMER_MIN_SIZE")
     parser.add_argument('--max-size', type=int, default=23, help="Primer3: PRIMER_MAX_SIZE")
     parser.add_argument('--min-gc', type=int, default=40, help="Primer3: PRIMER_MIN_GC")
@@ -834,7 +794,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--prefer-primer-idx', help="Prefer primers with length closer to given index. Example 0:2")
     parser.add_argument(
-        '--prefer-gc', help="Prefer primers with GC% closer to given values. Example 50:10")
+        '--prefer-gc', help="Prefer primers with GC closer to given values. Example 50:10")
     parser.add_argument(
         '--prefer-tm', help="Prefer primers with length closer to given values. Example 60:2")
 
