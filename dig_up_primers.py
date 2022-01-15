@@ -57,9 +57,6 @@ class _AssemblyProtocol:
         self._primer3_ssrs = None
         self._amplified_primers = None
 
-    def get_subdirs(self):
-        return [self.misa_dir, self.rm_dir, self.primer3_dir, self.amplify_dir, self.blast_db_dir]
-
     #
     def store_misa_ssrs(self, output_ssrs):
         bps = self.project.params['space_around']
@@ -74,7 +71,7 @@ class _AssemblyProtocol:
                         _current_seq_id = seq_id
                         break
                 else:
-                    assert False, '???'
+                    assert False, seq_id
             #
             if start > bps and end + bps < len(record.seq):  # Is SSR on sequence end
                 seq_part = record.seq[start - 1 - bps:end + bps]  # Stores sequence part
@@ -145,6 +142,9 @@ class _Assembly_RM_Primer3(_AssemblyProtocol):
         self.primer3_dir = os.path.join('3_Primer3', assembly_dir)
         super().__init__(project, assembly_idx, assembly_file, assembly_dir)
 
+    def get_subdirs(self):
+        return ['1_MISA', '2_RepeatMasker', '3_Primer3', '5_amplify']
+
     def get_ssrs_for_repeat_masker(self):
         return self.get_misa_ssrs()
 
@@ -160,6 +160,9 @@ class _Assembly_Primer3_RM(_AssemblyProtocol):
         self.primer3_dir = os.path.join('2_Primer3', assembly_dir)
         self.rm_dir = os.path.join('3_RepeatMasker', assembly_dir)
         super().__init__(project, assembly_idx, assembly_file, assembly_dir)
+
+    def get_subdirs(self):
+        return ['1_MISA', '2_Primer3', '3_RepeatMasker', '5_amplify']
 
     def get_ssrs_for_primer3(self):
         return self.get_misa_ssrs()
@@ -236,12 +239,11 @@ class _Project:
                 print(f'Removing file: {f}')
                 os.remove(f)
 
-        for a_data in self.assembly_objs:
-            for _dir in a_data.get_subdirs():
-                f = os.path.basename(_dir)
-                if f[0].isdigit() and int(f[0]) >= delete_from and os.path.isdir(_dir):
-                    print(f'Removing directory: {_dir}')
-                    shutil.rmtree(_dir)
+        for _dir in self.assembly_objs[0].get_subdirs():
+            f = os.path.basename(_dir)
+            if f[0].isdigit() and int(f[0]) >= delete_from and os.path.isdir(_dir):
+                print(f'Removing directory: {_dir}')
+                shutil.rmtree(_dir)
 
     #
     def _exe_prog(self, cmd, cwd):
@@ -322,18 +324,19 @@ def _misa(a_data, proj):
             id_2_ssrs[_id].append((_id, int(start), int(end), _s, int(_rep)))
 
     # Remove SSRs that are close
-    cleaned_ssrs = dict()
+    output_ssrs = []
     num_close = 0
     space_around = proj.params['space_around']
+    # Note: it is important to iterate in input sequences order. It is guaranteed in python 3.7+!
     for _id, ssrs in id_2_ssrs.items():
         ssrs.sort()  # Inline sort. Note: newer MISA version take a care about sorting!
         to_remove = set(chain.from_iterable((idx, idx + 1) for idx, ssr2 in enumerate(ssrs[1:])
                                             if ssr2[1] - ssrs[idx][2] <= space_around))
         num_close += len(to_remove)
-        cleaned_ssrs[_id] = [ssr for idx, ssr in enumerate(ssrs) if idx not in to_remove]
+        output_ssrs.extend([ssr for idx, ssr in enumerate(ssrs) if idx not in to_remove])
+    num_good = len(output_ssrs)
 
     # Store SSRs in CSV file
-    output_ssrs = list(chain(*(v for _, v in sorted(cleaned_ssrs.items()))))
     if sml := proj.params['ssr_max_length']:
         output_ssrs = [ssr for ssr in output_ssrs if len(ssr[3]) * ssr[4] <= sml]
     if mms := proj.params.get('misa_max_ssrs'):
@@ -349,7 +352,7 @@ Composite SSRs        : {num_composite}
 Removed close to SSRs : {num_close}
 Removed close to ends : {num_before_store - len(output_ssrs)}
 {motif_1}
-Good SSRs             : {sum(map(len, cleaned_ssrs.values()))}
+Good SSRs             : {num_good}
 """)
 
 
@@ -414,6 +417,7 @@ PRIMER_TASK=generic
 PRIMER_PICK_LEFT_PRIMER=1
 PRIMER_PICK_INTERNAL_OLIGO=1
 PRIMER_PICK_RIGHT_PRIMER=1
+PRIMER_NUM_RETURN={primer3_num_return}
 PRIMER_MIN_SIZE={min_size}
 PRIMER_MAX_SIZE={max_size}
 PRIMER_MIN_GC={min_gc}
@@ -451,12 +455,7 @@ def _primer3(a_data, proj):
     # Write settings file
     proj.ensure_dir(a_data.primer3_dir)
     with open(os.path.join(a_data.primer3_dir, 'primer3.set'), 'w') as _out:
-        _out.write(_primer_params.format(
-            min_size=proj.params['min_size'], max_size=proj.params['max_size'],
-            min_gc=proj.params['min_gc'], max_gc=proj.params['max_gc'],
-            min_tm=proj.params['min_tm'], max_tm=proj.params['max_tm'],
-            max_poly_x=proj.params['max_poly_x'],
-            product_size_range=proj.params['product_size_range']))
+        _out.write(_primer_params.format(**proj.params))
 
     # Write input file
     output_files = []
@@ -592,7 +591,7 @@ def _amplify(a_data, proj):
             zero_aplifications += 1
     #
     a_data.store_aplified_primers(ampl_res)
-    proj.write_text(os.path.join(a_data.primer3_dir, 'report.txt'), f"""REPORT
+    proj.write_text(os.path.join(a_data.amplify_dir, 'report.txt'), f"""REPORT
 
 Blast results       : {num_blast_results}
 
@@ -682,6 +681,7 @@ def find_params(params):
                         misa_repeats=params.misa_repeats,
                         ssr_max_length=params.ssr_max_length,
                         max_repeat_diff=params.max_repeat_diff,
+                        primer3_num_return=params.primer3_num_return,
                         product_size_range=params.product_size_range,
                         min_size=params.min_size, max_size=params.max_size,
                         min_gc=params.min_gc, max_gc=params.max_gc,
@@ -775,7 +775,8 @@ if __name__ == '__main__':
         help='How many bps can RepeatMasker repeat be longer than MISA repeat')
 
     # Primer3 params
-    parser.add_argument('--product-size-range', default='180-240', help="Primer3: PRIMER_PRODUCT_SIZE_RANGE")
+    parser.add_argument('--primer3-num-return', type=int, default=2, help="Primer3: PRIMER_NUM_RETURN")
+    parser.add_argument('--product-size-range', default='100-250', help="Primer3: PRIMER_PRODUCT_SIZE_RANGE")
     parser.add_argument('--min-size', type=int, default=19, help="Primer3: PRIMER_MIN_SIZE")
     parser.add_argument('--max-size', type=int, default=23, help="Primer3: PRIMER_MAX_SIZE")
     parser.add_argument('--min-gc', type=int, default=40, help="Primer3: PRIMER_MIN_GC")
@@ -792,7 +793,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--prefer-primer-length', help="Prefer primers with length closer to given values. Example 23:3")
     parser.add_argument(
-        '--prefer-primer-idx', help="Prefer primers with length closer to given index. Example 0:2")
+        '--prefer-primer-idx', help="Prefer primers with length closer to given index. Example 0:1")
     parser.add_argument(
         '--prefer-gc', help="Prefer primers with GC closer to given values. Example 50:10")
     parser.add_argument(
