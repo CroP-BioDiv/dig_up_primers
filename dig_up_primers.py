@@ -613,7 +613,7 @@ def _finalize(proj):
     if len(proj.assembly_objs) == 1:
         primers = proj.assembly_objs[0].get_aplified_primers()
     else:
-        primers = set.intersection(*proj.assembly_objs.get_aplified_primers())
+        primers = set.intersection(*(o.get_aplified_primers() for o in proj.assembly_objs))
 
     # Score methods
     _center = lambda x, c, r: abs(x - c) / r
