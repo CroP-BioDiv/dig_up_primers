@@ -130,8 +130,7 @@ class _AssemblyProtocol:
         if not os.path.isdir(self.blast_db_dir):
             self.project.ensure_dir(self.blast_db_dir)
             cmd = ['makeblastdb', '-dbtype', 'nucl', '-parse_seqids',
-                   '-in', self.assembly_file, '-out', 'db',
-                   '-title', 'db']
+                   '-in', self.assembly_file, '-out', 'db', '-title', 'db']
             self.project._exe_prog(cmd, self.blast_db_dir)
         return os.path.abspath(os.path.join(self.blast_db_dir, 'db'))
 
@@ -200,6 +199,9 @@ class _Project:
 
     def merge_ssrs(self):
         self.assembly_cls.merge_ssrs(self.assembly_objs, self._merged_primers_csv)
+
+    def merge_ssrs_first(self):
+        os.symlink(self.assembly_objs[0].get_ssrs_filename_for_merging(), self._merged_primers_csv)
 
     def get_merged_primers(self):
         if self._merged_primers is None:
@@ -719,16 +721,18 @@ def process_project(params, delete_from=None):
         proj.delete_from(delete_from)
 
     if not os.path.isfile(proj._merged_primers_csv):
-        for a_data in proj.assembly_objs:
-            _misa(a_data, proj)
-            if proj.params['workflow'] == 'rp':
-                _repeat_masker(a_data, proj)
-                _primer3(a_data, proj)
-            else:
-                _primer3(a_data, proj)
-                _repeat_masker(a_data, proj)
+        a_data = proj.assembly_objs[0]
+        # for a_data in proj.assembly_objs:  # To locate SSRs in all assemblies
+        _misa(a_data, proj)
+        if proj.params['workflow'] == 'rp':
+            _repeat_masker(a_data, proj)
+            _primer3(a_data, proj)
+        else:
+            _primer3(a_data, proj)
+            _repeat_masker(a_data, proj)
 
-        proj.merge_ssrs()
+        proj.merge_ssrs_first()
+        # proj.merge_ssrs()                  # In case of locating SSRs in all assemblies
 
     for a_data in proj.assembly_objs:
         _amplify(a_data, proj)
