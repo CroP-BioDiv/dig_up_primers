@@ -655,13 +655,13 @@ def _finalize(proj):
         #
         ssr = a_ssrs[ssr_idx]
         primer = ssr.primers[primer_index]
-        final_primers.append((_calc_score(primer, primer_index), ssr, primer, primer_index))
+        final_primers.append((_calc_score(primer, primer_index), ssr, primer))
 
     # Sort results by the score
     final_primers.sort()
     proj.write_csv(proj._final_primers_csv,
-                   [ssr[:-2] + primer + score + (primer_index,) for score, ssr, primer, primer_index in final_primers],
-                   _SSR.columns()[:-1] + primer.columns() + ('score', 'max_score', 'primer_index'))
+                   [ssr[:-2] + primer + score for score, ssr, primer in final_primers],
+                   _SSR.columns()[:-1] + primer.columns() + ('score', 'max_score'))
 
 
 # -------------------------------------------------------------------
