@@ -117,12 +117,12 @@ class _AssemblyProtocol:
 
     #
     def store_aplified_primers(self, ampl_res):
-        self.project.write_csv(self.amplify_primers_csv, [[a] for a in ampl_res], ['primer_idx'])
-        self._amplified_primers = set(ampl_res)
+        self.project.write_csv(self.amplify_primers_csv, ampl_res, ['primer_idx', 'num_repeats', 'ampl_length'])
+        self._amplified_primers = ampl_res
 
     def get_aplified_primers(self):
         if self._amplified_primers is None:
-            self._amplified_primers = set(a[0] for a in self.project.read_csv(self.amplify_primers_csv))
+            self._amplified_primers = list(self.project.read_csv(self.amplify_primers_csv))
         return self._amplified_primers
 
     #
@@ -191,6 +191,7 @@ class _Project:
         # MISA
         misa_repeats = params['misa_repeats'].split(',')
         self.used_repeats = [int(r.split('-')[0]) for r in misa_repeats]
+        self.min_repeats = dict((int(r.split('-')[0]), int(r.split('-')[1])) for r in misa_repeats)
         self.misa_repeats = ' '.join(misa_repeats)
         #
         zero_pad = '{:0>' + str(len(str(len(self.params['assemblies'])))) + '}'
@@ -517,11 +518,13 @@ def _amplify(a_data, proj):
     if os.path.isfile(a_data.amplify_primers_csv):
         return
 
+    ssrs = proj.get_merged_primers()
+    ssr_idx_2_ssr = dict((ssr.ssr_idx, ssr) for ssr in ssrs)
+
     # Run blastn, if needed
     res_xml = os.path.join(a_data.amplify_dir, 'results.xml')
     if not os.path.isfile(res_xml):
         proj.ensure_dir(a_data.amplify_dir)
-        ssrs = proj.get_merged_primers()
         with open(os.path.join(a_data.amplify_dir, 'query.fa'), 'w') as _query:
             for sn in ssrs:
                 for p in sn.primers:
@@ -542,9 +545,9 @@ def _amplify(a_data, proj):
     with open(res_xml, 'r') as result:
         for record in NCBIXML.parse(result):
             if record.alignments:  # Primer side (left, rigth)
-                primer_idx = record.query
-                ssr_idx = primer_idx[:-2]
-                primer_side = int(primer_idx[-1] == 'R')
+                primer_idx_side = record.query
+                primer_idx = primer_idx_side[:-2]
+                primer_side = int(primer_idx_side[-1] == 'R')
                 query_length = record.query_length
 
                 for align in record.alignments[:10]:
@@ -557,19 +560,23 @@ def _amplify(a_data, proj):
                         assert hsp.strand[0] == 'Plus'
                         assert hsp.query_start == 1, hsp.query_start
                         assert hsp.query_end == query_length, hsp.query_end
-                        blast_res[ssr_idx][seq_id][primer_side].append((hsp.sbjct_start, hsp.sbjct_end, hsp.strand[1]))
+                        blast_res[primer_idx][seq_id][primer_side].append((hsp.sbjct_start, hsp.sbjct_end, hsp.strand[1]))
 
     # Find amplifications
-    more_aplifications = 0
-    zero_aplifications = 0
+    more_amplifications = 0
+    zero_amplifications = 0
+    one_wrong_amplifications = 0
     num_blast_results = 0
     max_ampl = proj.params['max_amplification_length']
     min_p_length, max_p_length = map(int, proj.params['product_size_range'].split('-'))
+    _seqs = dict((rec.id, str(rec.seq)) for rec in SeqIO.parse(a_data.assembly_file, 'fasta'))
+
     ampl_res = []
     for primer_idx, seq_data in blast_res.items():
         num_blast_results += 1
         amplifications = 0
         ampl_length = None
+        ampl_region = None
         for seq_id, (left, right) in seq_data.items():
             if left and right:
                 # Note: lists are short, not needed anything clever, like sorting and bisect()!
@@ -579,27 +586,44 @@ def _amplify(a_data, proj):
                         if 0 <= dist <= max_ampl:
                             amplifications += 1
                             if amplifications > 1:
-                                more_aplifications += 1
+                                more_amplifications += 1
                                 break
                             ampl_length = dist
+                            _all_ls = (l_start, l_end, r_start, r_end)
+                            ampl_region = [seq_id, min(_all_ls), max(_all_ls)]
                 if amplifications > 1:
                     break
         #
         if amplifications == 1:
-            # Chck is amplified region in good range
-            if min_p_length <= ampl_length <= max_p_length:
-                ampl_res.append(primer_idx)
+            # Check is amplified region in good range
+            ssr_idx, p_idx = primer_idx.rsplit('_', 1)  # ToDo: split() is better
+            if min_p_length <= ampl_length <= max_p_length and \
+               (desc := _ampl_num_motifs(proj, ssr_idx_2_ssr[ssr_idx], int(p_idx), _seqs[ampl_region[0]], *ampl_region[1:])):
+                ampl_res.append([primer_idx, *desc])
+            else:
+                one_wrong_amplifications += 1
         elif not amplifications:
-            zero_aplifications += 1
+            zero_amplifications += 1
     #
     a_data.store_aplified_primers(ampl_res)
     proj.write_text(os.path.join(a_data.amplify_dir, 'report.txt'), f"""REPORT
 
-Blast results       : {num_blast_results}
+Blast results            : {num_blast_results}
 
-More amplifications : {more_aplifications}
-Zero amplifications : {zero_aplifications}
+More amplifications      : {more_amplifications}
+One wrong amplifications : {one_wrong_amplifications}
+Zero amplifications      : {zero_amplifications}
 """)
+
+
+def _ampl_num_motifs(proj, ssr, p_idx, contig, start, end):
+    # return [1, 1]
+    primer = ssr.primers[p_idx]
+    inner = contig[max(0, start + len(primer.left) - 1):(end - len(primer.right))]
+    min_r = max(3, proj.min_repeats[len(ssr.motif)] - 3)
+    if (m := re.search(rf'({ssr.motif}){{{min_r},}}', inner, re.IGNORECASE)):
+        s, e = m.span()
+        return [(e - s) // len(ssr.motif), end - start + 1]
 
 
 # -------------------------------------------------------------------
@@ -610,30 +634,34 @@ def _finalize(proj):
         return
 
     # Collect set of primer idxs
-    if len(proj.assembly_objs) == 1:
-        primers = proj.assembly_objs[0].get_aplified_primers()
-    else:
-        primers = set.intersection(*(o.get_aplified_primers() for o in proj.assembly_objs))
+    amplifications = [dict((p_idx, [n, _l]) for p_idx, n, _l in a.get_aplified_primers()) for a in proj.assembly_objs]
+    primers = set.intersection(*(set(d.keys()) for d in amplifications))
 
     # Score methods
     _center = lambda x, c, r: abs(x - c) / r
+    def _asm_c(ssr, primer, amp):
+        min_r = proj.min_repeats[len(ssr.motif)]
+        score = sum(int(n < min_r) for n, _ in asm) * 100
+
+        pass
+
     _mehtods = []
     if pp_len := proj.params['prefer_primer_length']:
-        _mehtods.append(lambda primer, _: _center(len(primer.left), *pp_len) + _center(len(primer.right), *pp_len))
+        _mehtods.append(lambda _, primer, _a: _center(len(primer.left), *pp_len) + _center(len(primer.right), *pp_len))
     if pp_idx := proj.params['prefer_primer_idx']:
-        _mehtods.append(lambda _, primer_idx: _center(primer_idx, *pp_idx))
+        _mehtods.append(lambda _, primer, _a: _center(primer.p_idx, *pp_idx))
     if p_gc := proj.params['prefer_gc']:
-        _mehtods.append(lambda primer, _: _center(primer.gc, *p_gc))
+        _mehtods.append(lambda _, primer, _a: _center(primer.gc, *p_gc))
     if p_tm := proj.params['prefer_tm']:
-        _mehtods.append(lambda primer, _: _center(primer.tm, *p_tm))
+        _mehtods.append(lambda _, primer, _a: _center(primer.tm, *p_tm))
 
     if _mehtods:
-        def _calc_score(primer, prime_index):  # Less is better
+        def _calc_score(ssr, primer, amp):  # Less is better
             # int(s*100) removes digits, precision is futile :-)
-            scores = [int(100 * m(primer, prime_index)) for m in _mehtods]
+            scores = [int(100 * m(ssr, primer, amp)) for m in _mehtods]
             return sum(scores), max(scores)
     else:
-        def _calc_score(primer, prime_index):
+        def _calc_score(ssr, primer, amp):
             return 0, 0
 
     # Collect data
@@ -655,13 +683,15 @@ def _finalize(proj):
         #
         ssr = a_ssrs[ssr_idx]
         primer = ssr.primers[primer_index]
-        final_primers.append((_calc_score(primer, primer_index), ssr, primer))
+        amp = [d[p_idx] for d in amplifications]
+        final_primers.append((_calc_score(ssr, primer, amp), ssr, primer, amp))
 
     # Sort results by the score
     final_primers.sort()
+    amp_cs = tuple(chain(*((f'a{idx}_repeats', f'a{idx}_length') for idx in range(1, len(proj.assembly_objs) + 1))))
     proj.write_csv(proj._final_primers_csv,
-                   [ssr[:-2] + primer + score for score, ssr, primer in final_primers],
-                   _SSR.columns()[:-1] + primer.columns() + ('score', 'max_score'))
+                   [ssr[:-2] + primer + tuple(chain(*amp)) + score for score, ssr, primer, amp in final_primers],
+                   _SSR.columns()[:-1] + _Primer.columns() + amp_cs + ('score', 'max_score'))
 
 
 # -------------------------------------------------------------------
