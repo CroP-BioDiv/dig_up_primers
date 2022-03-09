@@ -550,7 +550,7 @@ def _amplify(a_data, proj):
                 primer_side = int(primer_idx_side[-1] == 'R')
                 query_length = record.query_length
 
-                for align in record.alignments[:10]:
+                for align in record.alignments:
                     seq_id = align.hit_id
                     for hsp in align.hsps:
                         # Match has to be exact! Controlled, not 100%, with arguments perc_identity=100, evalue=1e-1
