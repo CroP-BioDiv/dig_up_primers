@@ -57,6 +57,9 @@ class _AssemblyProtocol:
         self._primer3_ssrs = None
         self._amplified_primers = None
 
+    def read_assembly_dict(self):
+        return dict((rec.id, str(rec.seq)) for rec in SeqIO.parse(self.assembly_file, 'fasta'))
+
     #
     def store_misa_ssrs(self, output_ssrs):
         bps = self.project.params['space_around']
@@ -178,7 +181,7 @@ class _Assembly_Primer3_RM(_AssemblyProtocol):
 
 
 #
-class _Project:
+class DigProject:
     _primer_line_start = '  '
     _merged_primers_csv = '4_merged_primers.csv'
     _final_primers_csv = '6_final_primers.csv'
@@ -233,6 +236,25 @@ class _Project:
                 else:
                     ssrs.append(_SSR(*fields))
         return ssrs
+
+    #
+    def write_results(self, final_primers):
+        final_primers.sort()  # Sort results by the score
+        amp_cs = tuple(chain(*((f'a{idx}_repeats', f'a{idx}_length') for idx in range(1, len(self.assembly_objs) + 1))))
+        self.write_csv(self._final_primers_csv,
+                       [ssr[:-2] + primer + tuple(chain(*amp)) + score for score, ssr, primer, amp in final_primers],
+                        _SSR.columns()[:-1] + _Primer.columns() + amp_cs + ('score', 'max_score'))
+
+    def read_results(self):
+        amp_cs = tuple(chain(*((f'a{idx}_repeats', f'a{idx}_length') for idx in range(1, len(self.assembly_objs) + 1))))
+        columns = _SSR.columns()[:-1] + _Primer.columns() + amp_cs + ('score', 'max_score')
+        res_cls = namedtuple('_Result', columns)
+        # Set right data types
+        _n = lambda x: x
+        f_ms = [_n, _n, int, int, _n, int, int, _n, _n, int, float, float] + [int] * (2 * len(self.assembly_objs) + 2)
+        with open(self._final_primers_csv, 'r') as _csv:
+            next(_csv)  # Skip header
+            return [res_cls(*(f(v) for f, v in zip(f_ms, line.strip().split(';')))) for line in _csv]
 
     #
     def delete_from(self, delete_from):
@@ -390,7 +412,7 @@ def _repeat_masker(a_data, proj):
     rm_ssrs = []
     for sec_record in SeqIO.parse(query_fa + '.masked', 'fasta'):
         sn = ssrs[sec_record.id]
-        num_diff = sum(1 for a, b in zip(sn.seq_part, str(sec_record.seq)) if a != b)
+        num_diff = sum(1 for a, b in zip(sn.seq_part.upper(), str(sec_record.seq).upper()) if a != b)
         if (num_diff - len(sn.motif) * sn.repeats) <= max_repeat_diff:
             rm_ssrs.append(sn)
 
@@ -552,6 +574,12 @@ def _amplify(a_data, proj):
 
                 for align in record.alignments:
                     seq_id = align.hit_id
+                    # If primer_idx starts with NC_, than Blast hit_id can be like: ref|NC_041794.1| or gb|MPGU01000001.1|
+                    if seq_id.startswith('ref|') and seq_id.endswith('|'):
+                        seq_id = seq_id[4:-1]
+
+                    elif seq_id.startswith('gb|') and seq_id.endswith('|'):
+                        seq_id = seq_id[3:-1]
                     for hsp in align.hsps:
                         # Match has to be exact! Controlled, not 100%, with arguments perc_identity=100, evalue=1e-1
                         if hsp.align_length != query_length or hsp.identities != query_length:
@@ -569,7 +597,7 @@ def _amplify(a_data, proj):
     num_blast_results = 0
     max_ampl = proj.params['max_amplification_length']
     min_p_length, max_p_length = map(int, proj.params['product_size_range'].split('-'))
-    _seqs = dict((rec.id, str(rec.seq)) for rec in SeqIO.parse(a_data.assembly_file, 'fasta'))
+    _seqs = read_assembly_dict(self)
 
     ampl_res = []
     for primer_idx, seq_data in blast_res.items():
@@ -643,8 +671,7 @@ def _finalize(proj):
         min_r = proj.min_repeats[len(ssr.motif)]
         score = sum(int(n < min_r) for n, _ in asm) * 100
 
-        pass
-
+    #
     _mehtods = []
     if pp_len := proj.params['prefer_primer_length']:
         _mehtods.append(lambda _, primer, _a: _center(len(primer.left), *pp_len) + _center(len(primer.right), *pp_len))
@@ -672,6 +699,11 @@ def _finalize(proj):
         ssr_idx, primer_index = p_idx.rsplit('_', 1)
         if last_ssr_idx == ssr_idx:  # SSR already processed
             continue
+
+        amp = [d[p_idx] for d in amplifications]
+        if len(amp) > 1 and all(a == amp[0] for a in amp[1:]):  # All apmplifications are the same!
+            continue
+
         last_ssr_idx = ssr_idx
         primer_index = int(primer_index)
         assembly_idx = ssr_idx.split('_', 1)[0]
@@ -683,15 +715,9 @@ def _finalize(proj):
         #
         ssr = a_ssrs[ssr_idx]
         primer = ssr.primers[primer_index]
-        amp = [d[p_idx] for d in amplifications]
         final_primers.append((_calc_score(ssr, primer, amp), ssr, primer, amp))
-
-    # Sort results by the score
-    final_primers.sort()
-    amp_cs = tuple(chain(*((f'a{idx}_repeats', f'a{idx}_length') for idx in range(1, len(proj.assembly_objs) + 1))))
-    proj.write_csv(proj._final_primers_csv,
-                   [ssr[:-2] + primer + tuple(chain(*amp)) + score for score, ssr, primer, amp in final_primers],
-                   _SSR.columns()[:-1] + _Primer.columns() + amp_cs + ('score', 'max_score'))
+    #
+    proj.write_results(final_primers)
 
 
 # -------------------------------------------------------------------
@@ -745,7 +771,7 @@ def _prefered(desc, default):
 
 
 def process_project(params, delete_from=None):
-    proj = _Project(params)
+    proj = DigProject(params)
 
     if delete_from:
         proj.delete_from(delete_from)
