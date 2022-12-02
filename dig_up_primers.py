@@ -577,9 +577,10 @@ def _amplify(a_data, proj):
                     # If primer_idx starts with NC_, than Blast hit_id can be like: ref|NC_041794.1| or gb|MPGU01000001.1|
                     if seq_id.startswith('ref|') and seq_id.endswith('|'):
                         seq_id = seq_id[4:-1]
-
                     elif seq_id.startswith('gb|') and seq_id.endswith('|'):
                         seq_id = seq_id[3:-1]
+                    assert not seq_id.endswith('|'), seq_id
+
                     for hsp in align.hsps:
                         # Match has to be exact! Controlled, not 100%, with arguments perc_identity=100, evalue=1e-1
                         if hsp.align_length != query_length or hsp.identities != query_length:
@@ -597,7 +598,7 @@ def _amplify(a_data, proj):
     num_blast_results = 0
     max_ampl = proj.params['max_amplification_length']
     min_p_length, max_p_length = map(int, proj.params['product_size_range'].split('-'))
-    _seqs = read_assembly_dict(self)
+    _seqs = a_data.read_assembly_dict()
 
     ampl_res = []
     for primer_idx, seq_data in blast_res.items():
