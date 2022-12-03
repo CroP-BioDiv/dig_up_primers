@@ -4,6 +4,7 @@ import os
 import shutil
 import re
 import json
+import time
 import subprocess
 from collections import namedtuple, defaultdict
 from types import SimpleNamespace
@@ -11,6 +12,55 @@ from itertools import chain, product
 from concurrent.futures import ThreadPoolExecutor
 from Bio import SeqIO
 from Bio.Blast import NCBIXML
+
+
+class _TimeSteps:
+    def __init__(self, filename):
+        self.filename = filename
+        if os.path.isfile(filename):
+            with open(v, 'r') as _in:
+                self.steps = json.load(_in)
+        else:
+            self.steps = []  # dicts
+        self.steps_in_progress = []
+
+    def store(self):
+        with open(self.filename, 'w', encoding='utf-8') as _out:
+            json.dump(self.steps, _out, indent=4)
+
+    def start(self, name):
+        self.steps_in_progress.append(dict(name=name, start=time.time()))
+
+    def _readable(self, lasted):
+        fs = [0, 0, 0]
+        if lasted >= 3600:
+            fs[0] = f'{lasted // 3600}h'
+            lasted = lasted % 3600
+        if lasted >= 60:
+            fs[1] = f'{lasted // 60}m'
+            lasted = lasted % 60
+        fs[2] = f'{int(round(lasted))}s'
+        f_i = 0 if fs[0] else (1 if fs[1] else 2)
+        return ' '.join(fs[f_i:])
+
+    def end(self):
+        d = self.steps_in_progress.pop()
+        d['end'] = time.time()
+        d['lasted'] = d['end'] - d['start']
+        d['readable'] = self._readable(d['lasted'])
+        for old in self.steps:
+            if old['name'] == d['name']:
+                if old['lasted'] < d ['lasted']:  # Take longer
+                    old.update((a, d[a]) for a in ('start', 'end', 'lasted', 'readable'))
+                    self.store()
+                return
+        self.steps.append(d)
+        self.store()
+
+    def start_method(self, name, method, *args, **kwargs):
+        self.start(name)
+        r = method(*args, **kwargs)
+        self.end()
 
 
 class _Primer(namedtuple('_Primer', 'p_idx, left, right, length, gc, tm')):
@@ -200,6 +250,9 @@ class DigProject:
         zero_pad = '{:0>' + str(len(str(len(self.params['assemblies'])))) + '}'
         self.assembly_objs = [self.assembly_cls(self, idx, a_f, f'assembly_{zero_pad.format(idx)}')
                               for idx, a_f in enumerate(params['assemblies'])]
+
+    def get_time_steps(self):
+        return _TimeSteps('duration_of_steps.json')
 
     def merge_ssrs(self):
         self.assembly_cls.merge_ssrs(self.assembly_objs, self._merged_primers_csv)
@@ -773,6 +826,7 @@ def _prefered(desc, default):
 
 def process_project(params, delete_from=None):
     proj = DigProject(params)
+    time_steps = proj.get_time_steps()
 
     if delete_from:
         proj.delete_from(delete_from)
@@ -780,21 +834,21 @@ def process_project(params, delete_from=None):
     if not os.path.isfile(proj._merged_primers_csv):
         a_data = proj.assembly_objs[0]
         # for a_data in proj.assembly_objs:  # To locate SSRs in all assemblies
-        _misa(a_data, proj)
+        time_steps.start_method('1_MISA', _misa, a_data, proj)
         if proj.params['workflow'] == 'rp':
-            _repeat_masker(a_data, proj)
-            _primer3(a_data, proj)
+            time_steps.start_method('2_RepeatMasker', _repeat_masker, a_data, proj)
+            time_steps.start_method('3_Primer3', _primer3, a_data, proj)
         else:
-            _primer3(a_data, proj)
-            _repeat_masker(a_data, proj)
+            time_steps.start_method('2_Primer3', _primer3, a_data, proj)
+            time_steps.start_method('3_RepeatMasker', _repeat_masker, a_data, proj)
 
-        proj.merge_ssrs_first()
+        time_steps.start_method('4_Merge', proj.merge_ssrs_first)
         # proj.merge_ssrs()                  # In case of locating SSRs in all assemblies
 
-    for a_data in proj.assembly_objs:
-        _amplify(a_data, proj)
+    for idx, a_data in enumerate(proj.assembly_objs):
+        time_steps.start_method(f'5_Amplify_{idx}', _amplify, a_data, proj)
 
-    _finalize(proj)
+    time_steps.start_method('6_Finalize', _finalize, proj)
 
 
 if __name__ == '__main__':

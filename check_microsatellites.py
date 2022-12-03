@@ -125,7 +125,6 @@ def check_microsatellites(params):
     ssrs_p3 = set(r.ssr_idx for r in first_assembly.get_primer_ssrs())
     ssrs_rm = set(r.ssr_idx for r in project.read_primers(first_assembly.rm_ssrs_csv))
     ssrs_amps = [set(s[0].rsplit('_', 1)[0] for s in a.get_aplified_primers()) for a in project.assembly_objs]
-    # ssrs_final = dict((r.ssr_idx, r) for r in project.read_results())
     ssrs_final = set(r.ssr_idx for r in project.read_results())
 
     lines = []
@@ -158,7 +157,6 @@ def check_microsatellites(params):
         else:
             not_found.append(microsatellite)
             # lines.append(f'    {microsatellite:<10} : not found')
-
     #
     l_amps = '\n'.join(f'      Amplification {i} : {len(ssrs):>6}' for i, ssrs in enumerate(ssrs_amps))
     mics = '\n'.join(lines)
