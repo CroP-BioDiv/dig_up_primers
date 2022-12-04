@@ -34,10 +34,10 @@ class _TimeSteps:
     def _readable(self, lasted):
         fs = [0, 0, 0]
         if lasted >= 3600:
-            fs[0] = f'{lasted // 3600}h'
+            fs[0] = f'{int(lasted // 3600)}h'
             lasted = lasted % 3600
         if lasted >= 60:
-            fs[1] = f'{lasted // 60}m'
+            fs[1] = f'{int(lasted // 60)}m'
             lasted = lasted % 60
         fs[2] = f'{int(round(lasted))}s'
         f_i = 0 if fs[0] else (1 if fs[1] else 2)
@@ -627,12 +627,9 @@ def _amplify(a_data, proj):
 
                 for align in record.alignments:
                     seq_id = align.hit_id
-                    # If primer_idx starts with NC_, than Blast hit_id can be like: ref|NC_041794.1| or gb|MPGU01000001.1|
-                    if seq_id.startswith('ref|') and seq_id.endswith('|'):
-                        seq_id = seq_id[4:-1]
-                    elif seq_id.startswith('gb|') and seq_id.endswith('|'):
-                        seq_id = seq_id[3:-1]
-                    assert not seq_id.endswith('|'), seq_id
+                    # If primer_idx starts with known prefixes (NC_, ..), than Blast hit_id can be like: ref|<id>|, gb|<id|, emb|<id>|
+                    if seq_id.endswith('|'):
+                        seq_id = seq_id[seq_id.index('|') + 1:-1]
 
                     for hsp in align.hsps:
                         # Match has to be exact! Controlled, not 100%, with arguments perc_identity=100, evalue=1e-1

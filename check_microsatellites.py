@@ -67,13 +67,9 @@ def _blast_microsatellites(out_dir, first_assembly, params):
                     microsatellite = record.query
                     for align in record.alignments:
                         seq_id = align.hit_id
-                        # If primer_idx starts with NC_, than Blast hit_id can be like: ref|NC_041794.1| or gb|MPGU01000001.1|
-                        if seq_id.startswith('ref|') and seq_id.endswith('|'):
-                            seq_id = seq_id[4:-1]
-                        elif seq_id.startswith('gb|') and seq_id.endswith('|'):
-                            seq_id = seq_id[3:-1]
-                        assert not seq_id.endswith('|'), seq_id
-
+                        # If primer_idx starts with known prefixes (NC_, ..), than Blast hit_id can be like: ref|<id>|, gb|<id|, emb|<id>|
+                        if seq_id.endswith('|'):
+                            seq_id = seq_id[seq_id.index('|') + 1:-1]
                         for hsp in align.hsps:
                             assert hsp.strand[0] == 'Plus'  # Just to be sure!
                             b_data.append(_Hit(
