@@ -7,7 +7,6 @@ import json
 import time
 import subprocess
 from collections import namedtuple, defaultdict
-from types import SimpleNamespace
 from itertools import chain, product
 from concurrent.futures import ThreadPoolExecutor
 from Bio import SeqIO
@@ -18,7 +17,7 @@ class _TimeSteps:
     def __init__(self, filename):
         self.filename = filename
         if os.path.isfile(filename):
-            with open(v, 'r') as _in:
+            with open(filename, 'r') as _in:
                 self.steps = json.load(_in)
         else:
             self.steps = []  # dicts

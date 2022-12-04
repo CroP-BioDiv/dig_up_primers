@@ -4,13 +4,11 @@ import os
 import csv
 import json
 import subprocess
-from collections import namedtuple, defaultdict
+import pandas
+from collections import defaultdict
 from Bio import Entrez
 from Bio.Blast import NCBIXML
-from dig_up_primers import DigProject
-
-_hit_columns = ['microsatellite', 'seq_id', 'start', 'end', 'strand', 'align_length', 'identities', 'ssrs']
-_Hit = namedtuple('_Hit', _hit_columns)
+from dig_up_primers import DigProject, _misa_ini
 
 
 def _fetch_microsatellites(species, retmax=18000):
@@ -38,17 +36,34 @@ def _get_microsatellites(out_dir, species):
     m_filename = os.path.join(out_dir, 'microsatellites.json')
     if os.path.isfile(m_filename):
         with open(m_filename, 'r') as _in:
-            return json.load(_in)
-    #
-    m_data = _fetch_microsatellites(species)
-    with open(m_filename, 'w', encoding='utf-8') as _out:
-        json.dump(m_data, _out, indent=2)
-    return m_data
+            m_data = json.load(_in)
+    else:
+        m_data = _fetch_microsatellites(species)
+        with open(m_filename, 'w', encoding='utf-8') as _out:
+            json.dump(m_data, _out, indent=2)
+
+    def _repeat_region(m):
+        for d in m.get('GBSeq_feature-table', []):
+            if d.get('GBFeature_key') == 'repeat_region' and (loc := d.get('GBFeature_location')):
+                start, end = loc.split('..')
+                start, end = (int(start) - 1), int(end)
+                # Sanity check
+                seq = m['GBSeq_sequence'][start:end] if end - start < len(m['GBSeq_sequence']) / 2 else '???'
+                return dict(start=start, end=end, sequence=seq)
+
+    return dict((m['GBSeq_locus'],
+                  dict(seq_id=m['GBSeq_locus'], sequence=m['GBSeq_sequence'], length=len(m['GBSeq_sequence']),
+                      repeats=[], hits=[], repeat_region=_repeat_region(m)))
+              for m in m_data)
 
 
-def _blast_microsatellites(out_dir, first_assembly, params):
+def _blast_microsatellites(out_dir, m_data, first_assembly, params):
+    # Create query file
+    query_filename = os.path.join(out_dir, 'microsatellites.fa')
+    with open(query_filename, 'w', encoding='utf-8') as _out:
+        _out.write(''.join(f">{m['seq_id']}\n{m['sequence'].upper()}\n" for m in m_data.values()))
+
     b_xml = 'blast_result.xml'
-    b_csv = 'blast_result.csv'
     blast_filename = os.path.join(out_dir, b_xml)
     if not os.path.isfile(blast_filename):
         cmd = ['blastn', '-db', first_assembly.get_blast_db(), '-query', 'microsatellites.fa', '-outfmt', '5', '-out', b_xml,
@@ -58,34 +73,48 @@ def _blast_microsatellites(out_dir, first_assembly, params):
         subprocess.run(cmd, cwd=out_dir)
 
     # Collect results
-    blast_csv = os.path.join(out_dir, b_csv)
-    if not os.path.isfile(blast_csv):
-        b_data = []
-        with open(blast_filename, 'r') as result:
-            for record in NCBIXML.parse(result):
-                if record.alignments:  # Primer side (left, rigth)
-                    microsatellite = record.query
-                    for align in record.alignments:
-                        seq_id = align.hit_id
-                        # If primer_idx starts with known prefixes (NC_, ..), than Blast hit_id can be like: ref|<id>|, gb|<id|, emb|<id>|
-                        if seq_id.endswith('|'):
-                            seq_id = seq_id[seq_id.index('|') + 1:-1]
-                        for hsp in align.hsps:
-                            assert hsp.strand[0] == 'Plus'  # Just to be sure!
-                            b_data.append(_Hit(
-                                microsatellite, seq_id, hsp.sbjct_start, hsp.sbjct_end, int(hsp.strand[1] == 'True'), hsp.align_length, hsp.identities, []))
-        with open(blast_csv, 'w') as _csv:
-            _csv.write(';'.join(_hit_columns[:-1]) + '\n')
-            _csv.write('\n'.join(';'.join(map(str, row[:-1])) for row in b_data))
-    else:
-        with open(blast_csv, 'r') as _csv:
-            next(_csv)
-            b_data = [_Hit(*fs[:2], *map(int, fs[2:]), []) for line in _csv if (fs := line.strip().split(';'))]
+    with open(blast_filename, 'r') as result:
+        for record in NCBIXML.parse(result):
+            if record.alignments:
+                m_hits = m_data[record.query]['hits']  # This is a list!
+                for align in record.alignments:
+                    seq_id = align.hit_id
+                    # If primer_idx starts with known prefixes (NC_, ..), than Blast hit_id can be like: ref|<id>|, gb|<id|, emb|<id>|
+                    if seq_id.endswith('|'):
+                        seq_id = seq_id[seq_id.index('|') + 1:-1]
+                    m_hits.extend(dict(seq_id=seq_id, hsp=hsp, repeats=[], ssrs=[]) for hsp in align.hsps)
 
-    mic_2_hits = defaultdict(list)        
-    for h in b_data:
-        mic_2_hits[h.microsatellite].append(h)
-    return mic_2_hits
+
+def _misa_on_all(project, out_dir, m_data):
+    misa_f = 'mics_hits.fa'
+    misa_result_filename = os.path.join(out_dir, f'{misa_f}.misa')
+    if not os.path.isfile(misa_result_filename):
+        # Create query file
+        query_filename = os.path.join(out_dir, misa_f)
+        with open(query_filename, 'w', encoding='utf-8') as _out:
+            for m in m_data.values():
+                _out.write(''.join(f">{m['seq_id']}\n{m['sequence'].upper()}\n"))
+                for idx, hit in enumerate(m['hits']):
+                    _out.write(''.join(f">{m['seq_id']}_{idx}\n{hit['hsp'].sbjct.upper()}\n"))
+
+        with open(os.path.join(out_dir, 'misa.ini'), 'w') as out:
+            out.write(_misa_ini.format(repeats=project.params['misa_repeats']))
+        cmd = ['misa.pl', misa_f]
+        print(f"Executing: {' '.join(cmd)}  (cwd: {out_dir})")
+        subprocess.run(cmd, cwd=out_dir)
+
+    # Read MISA output
+    with open(misa_result_filename, 'r') as _misa:
+        header = next(_misa)
+        for line in _misa:
+            mic_id, _, ssr_type, ssr, size, start, end = line.split()
+            ssr = dict(ssr_type=ssr_type, ssr=ssr, size=int(size), start=int(start), end=int(end))
+            hit_idx = None
+            if mic := m_data.get(mic_id):
+                mic['repeats'].append(ssr)
+            else:
+                mic_id, hit_idx = mic_id.rsplit('_', 1)
+                m_data[mic_id]['hits'][int(hit_idx)]['repeats'].append(ssr)
 
 
 def check_microsatellites(params):
@@ -104,13 +133,11 @@ def check_microsatellites(params):
     # Fetch (or load) microsatellie data
     m_data = _get_microsatellites(out_dir, params.species)
 
-    # Create query file
-    query_filename = os.path.join(out_dir, 'microsatellites.fa')
-    with open(query_filename, 'w', encoding='utf-8') as _out:
-        _out.write(''.join(f">{r['GBSeq_locus']}\n{r['GBSeq_sequence'].upper()}\n" for r in m_data))
-
     # Blast microsatellites on the first assembly
-    mic_2_hits = _blast_microsatellites(out_dir, first_assembly, params)
+    _blast_microsatellites(out_dir, m_data, first_assembly, params)
+
+    # Find repeats on microsatellites and blasted hits
+    _misa_on_all(project, out_dir, m_data)
 
     # Read project data
     seq_id_2_ssrs = defaultdict(list)
@@ -123,53 +150,77 @@ def check_microsatellites(params):
     ssrs_amps = [set(s[0].rsplit('_', 1)[0] for s in a.get_aplified_primers()) for a in project.assembly_objs]
     ssrs_final = set(r.ssr_idx for r in project.read_results())
 
-    lines = []
-    not_found = []
-    no_hit_with_ssrs = []
-    num_in_final = 0
-    prod_min, prod_max = map(int, project.params['product_size_range'].split('-'))
-    _ran = lambda _l: '+' if prod_min <= _l <= prod_max else '-'
+    for m in m_data.values():
+        for m_hit in m['hits']:
+            hsp = m_hit['hsp']
+            for ssr in seq_id_2_ssrs.get(m_hit['seq_id'], []):
+                if hsp.sbjct_start < ssr.start and ssr.end < hsp.sbjct_end:
+                    si = ssr.ssr_idx
+                    m_hit['ssrs'].append(dict(ssr=ssr,
+                                              in_misa=(si in ssrs_misa),
+                                              in_p3=(si in ssrs_p3),
+                                              in_rm=(si in ssrs_rm),
+                                              in_amplifies=[(si in s) for s in ssrs_amps],
+                                              in_final=(si in ssrs_final)))
+
+    # Results in excel
     _pm = lambda b: '+' if b else '-'
-    for m in sorted(m_data, key=lambda m: m['GBSeq_locus']):
-        microsatellite = m['GBSeq_locus']
-        m_len = int(m['GBSeq_length'])
-        if m_hits := mic_2_hits.get(microsatellite):
-            in_final = False
-            mm = microsatellite
-            for hit in m_hits:
-                for ssr in seq_id_2_ssrs.get(hit.seq_id, []):
-                    if hit.start < ssr.start and ssr.end < hit.end:
-                        si = ssr.ssr_idx
-                        if si in ssrs_final:
-                            in_final = True
-                        _amp = '  '.join(_pm(si in s) for s in ssrs_amps)
-                        lines.append(f'    {mm:<10} : {m_len:>4}  {_ran(m_len)}    {_pm(si in ssrs_misa)}  {_pm(si in ssrs_p3)}' +
-                                     f'  {_pm(si in ssrs_rm)}  {_amp}  {_pm(si in ssrs_final)}')
-                        mm = ''
-            if mm:
-                no_hit_with_ssrs.append(microsatellite)
-            if in_final:
-                num_in_final += 1
-        else:
-            not_found.append(microsatellite)
-            # lines.append(f'    {microsatellite:<10} : not found')
-    #
+    _R = lambda repeats: '; '.join(rp['ssr'] for rp in repeats) if repeats else None
+    _MC = lambda m: [m['seq_id'], None, m['length'], _R(m['repeats']),
+                     rp['sequence'] if (rp := m.get('repeat_region')) else None]
+    _HI = lambda h: [None, h['seq_id'], len(h['hsp'].sbjct), _R(h['repeats'])]  # h['hsp'].identities,
+    _S = lambda s: [None, None, None, f"({s['ssr'].motif}){s['ssr'].repeats}", None, _pm(s['in_p3']), _pm(s['in_rm'])] + \
+        [_pm(a) for a in s['in_amplifies']] + [_pm(s['in_final'])]
+
+    sheets = []
+    columns = ['Microsatellite', 'Sequence', 'Length', 'Repeats', 'Declared repeats', 'Primer3', 'RepeatMasker'] + \
+        [f'Amplification_{i + 1}' for i in range(len(project.assembly_objs))] + ['Final']
+    s_m_data = sorted(m_data.values(), key=lambda m: m['seq_id'])
+
+    if rows := [_MC(m) for m in s_m_data if not m['hits']]:
+        sheets.append(('Not found', columns[:5], rows))
+
+    rows = []  # Todo: dodati header-e
+    for m in s_m_data:
+        if m['hits'] and all(not h['ssrs'] for h in m['hits']):
+            rows.append(_MC(m))
+            rows.extend(_HI(h) for h in m['hits'])
+    if rows:
+        sheets.append(('Without SSRs', columns[:5], rows))
+
+
+    rows = []
+    for m in s_m_data:
+        if m['hits'] and any(h['ssrs'] for h in m['hits']):
+            rows.append(_MC(m))
+            for h in m['hits']:
+                rows.append(_HI(h))
+                rows.extend(_S(s) for s in h['ssrs'])
+    if rows:
+        sheets.append(('With SSRs', columns, rows))
+
+    writer = pandas.ExcelWriter(os.path.join(out_dir, 'results.xlsx'))
+    for name, columns, rows in sheets:
+        pandas.DataFrame(rows, columns=columns).to_excel(writer, sheet_name=name, index=None, header=True)
+    writer.save()
+
+    # Summary
     l_amps = '\n'.join(f'      Amplification {i} : {len(ssrs):>6}' for i, ssrs in enumerate(ssrs_amps))
-    mics = '\n'.join(lines)
     c_size = 10
+    not_found = [i for i, m in sorted(m_data.items()) if not m['hits']]
     nf = '\n'.join(('    ' + ', '.join(not_found[i:i + c_size])) for i in range(0, len(not_found), c_size))
+    no_hit_with_ssrs = [i for i, m in sorted(m_data.items()) if m['hits'] and all(not h['ssrs'] for h in m['hits'])]
     nhs = '\n'.join(('    ' + ', '.join(no_hit_with_ssrs[i:i + c_size])) for i in range(0, len(no_hit_with_ssrs), c_size))
-    
 
     summary = f"""Summary
 
 Microsatellites:
     Number        : {len(m_data)}
-    Length range  : {min(len(m['GBSeq_sequence']) for m in m_data)} - {max(len(m['GBSeq_sequence']) for m in m_data)}
+    Length range  : {min(m['length'] for m in m_data.values())} - {max(m['length'] for m in m_data.values())}
 
 Project data:
     MISA min repeats  : {project.params['misa_repeats']}
-    Product range     : {prod_min} - {prod_max}
+    Product range     : {project.params['product_size_range']}
     MISA SSRs         : {len(ssrs_misa):>6}
     Contigs with SSRs : {len(seq_id_2_ssrs):>6}
     Primer 3 SSRS     : {len(ssrs_p3):>6}
@@ -179,25 +230,21 @@ Project data:
     Final SSRS        : {len(ssrs_final):>6}
 
 Blast data:
-    Mapped microsatellites : {len(mic_2_hits):>6}
-    Overall hits           : {sum(len(v) for v in mic_2_hits.values()):>6}
+    Mapped microsatellites : {sum(int(bool(m['hits'])) for m in m_data.values()):>6}
+    Overall hits           : {sum(len(m['hits']) for m in m_data.values()):>6}
 
-Not blasted ({len(not_found)}):
+Not blasted ({sum(int(not m['hits']) for m in m_data.values())}):
 {nf}
 
 Blast hits without our SSRs ({len(no_hit_with_ssrs)}):
 {nhs}
 
-In final: {num_in_final}
-
-Process:          Len In   MI P3 RM {' '.join(f'A{i}' for i in range(len(ssrs_amps)))} FI
-{mics}
+In final: {sum(1 for m in m_data.values() if any(any(s['in_final'] for s in h['ssrs']) for h in m['hits']))}
 """
 
     print(summary)
     with open(os.path.join(out_dir, 'summary.txt'), 'w') as _out:
         _out.write(summary)
-
 
 
 if __name__ == '__main__':
