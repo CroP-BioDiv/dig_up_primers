@@ -13,7 +13,7 @@ from Bio import SeqIO
 from Bio.Blast import NCBIXML
 
 
-class _TimeSteps:
+class TimeSteps:
     def __init__(self, filename):
         self.filename = filename
         if os.path.isfile(filename):
@@ -99,7 +99,7 @@ class _AssemblyProtocol:
         self.primer3_primers_csv = os.path.join(self.primer3_dir, 'primers.csv')
         self.amplify_dir = os.path.join('5_amplify', assembly_dir)
         self.amplify_primers_csv = os.path.join(self.amplify_dir, 'primers.csv')
-        self.blast_db_dir = os.path.join('BlastDB', assembly_dir, )
+        self.blast_db_dir = os.path.join('BlastDB', assembly_dir)
         #
         self._misa_ssrs = None
         self._rm_ssrs = None
@@ -251,7 +251,7 @@ class DigProject:
                               for idx, a_f in enumerate(params['assemblies'])]
 
     def get_time_steps(self):
-        return _TimeSteps('duration_of_steps.json')
+        return TimeSteps('duration_of_steps.json')
 
     def merge_ssrs(self):
         self.assembly_cls.merge_ssrs(self.assembly_objs, self._merged_primers_csv)
