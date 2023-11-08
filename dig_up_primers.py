@@ -411,12 +411,14 @@ def _misa(a_data, proj):
                                             if ssr2[1] - ssrs[idx][2] <= space_around))
         num_close += len(to_remove)
         output_ssrs.extend([ssr for idx, ssr in enumerate(ssrs) if idx not in to_remove])
-    num_good = len(output_ssrs)
 
     # Store SSRs in CSV file
+    long_ssrs = ''
     if sml := proj.params['ssr_max_length']:
+        _num_before = len(output_ssrs)
         output_ssrs = [ssr for ssr in output_ssrs if len(ssr[3]) * ssr[4] <= sml]
-    if mms := proj.params.get('misa_max_ssrs'):
+        long_ssrs = f'\nLong SSRs             : {_num_before - len(output_ssrs)}'
+    if mms := proj.params.get('misa_max_ssrs'):  # For testing!
         output_ssrs = output_ssrs[:mms]
     num_before_store = len(output_ssrs)
     output_ssrs = a_data.store_misa_ssrs(output_ssrs)
@@ -425,11 +427,11 @@ def _misa(a_data, proj):
     proj.write_text(os.path.join(a_data.misa_dir, 'report.txt'), f"""REPORT
 
 SSRs found by MISA    : {num_misa_ssrs}
-Composite SSRs        : {num_composite}
+Composite SSRs        : {num_composite}{long_ssrs}
 Removed close to SSRs : {num_close}
 Removed close to ends : {num_before_store - len(output_ssrs)}
 {motif_1}
-Good SSRs             : {num_good}
+Good SSRs             : {len(output_ssrs)}
 """)
 
 
@@ -451,15 +453,24 @@ def _repeat_masker(a_data, proj):
 
     # Call RepeatMasker
     if not os.path.isfile(query_fa + '.masked'):
-        cmd = ['RepeatMasker', 'query.fa']
+        # cmd = ['RepeatMasker', 'query.fa']
+        cmd = ['RepeatMasker', '-e', 'hmmer', 'query.fa']
         if proj.num_threads > 1:
             # ToDo: add an argument. For now suppose nhmmer - 2 cores
             if (_nt := proj.num_threads // 2) > 1:
                 cmd.extend(['-pa', str(_nt)])
-
         proj._exe_prog(cmd, a_data.rm_dir)
 
-    # Process ouput
+    # Process output
+    close_to_coding = set()
+    with open(query_fa + '.out', 'r') as _in:
+        for _ in range(3):  # Skip header
+            next(_in)
+        for line in _in:
+            fields = line.split()
+            if fields[10] not in ('Low_complexity', 'Simple_repeat'):
+                close_to_coding.add(fields[4])
+
     max_repeat_diff = proj.params['max_repeat_diff']
     rm_ssrs = []
     for sec_record in SeqIO.parse(query_fa + '.masked', 'fasta'):
@@ -474,6 +485,9 @@ def _repeat_masker(a_data, proj):
 
 Input SSRs       : {len(ssrs)}
 Good SSRs        : {len(rm_ssrs)}
+
+Close to coding  : {len(close_to_coding)}
+Low complexity   : {len(ssrs) - len(rm_ssrs) - len(close_to_coding)}
 """)
 
 
@@ -537,16 +551,18 @@ def _primer3(a_data, proj):
     # Write input file
     output_files = []
     if proj.num_threads == 1:
-        _exec_primer3(a_data, proj, ssrs.values(), 'primer3.input', 'primer3.output', 'primer3.error')
         output_files.append('primer3.output')
+        if not os.path.isfile(os.path.join(a_data.primer3_dir, output_files[-1])):
+            _exec_primer3(a_data, proj, ssrs.values(), 'primer3.input', 'primer3.output', 'primer3.error')
     else:
         with ThreadPoolExecutor(max_workers=proj.num_threads) as executor:
             l_ssrs = list(ssrs.values())
             k, m = divmod(len(l_ssrs), proj.num_threads)
             for i in range(proj.num_threads):
                 output_files.append(f'primer3_{i}.output')
-                executor.submit(_exec_primer3, a_data, proj, l_ssrs[i * k + min(i, m):(i + 1) * k + min(i + 1, m)],
-                                f'primer3_{i}.input', output_files[-1], f'primer3_{i}.error')
+                if not os.path.isfile(os.path.join(a_data.primer3_dir, output_files[-1])):
+                    executor.submit(_exec_primer3, a_data, proj, l_ssrs[i * k + min(i, m):(i + 1) * k + min(i + 1, m)],
+                                    f'primer3_{i}.input', output_files[-1], f'primer3_{i}.error')
 
     # Process output
     num_primers = 0
@@ -579,9 +595,10 @@ def _primer3(a_data, proj):
     a_data.store_primer_ssrs(ssrs)
     proj.write_text(os.path.join(a_data.primer3_dir, 'report.txt'), f"""REPORT
 
-Input SSRs        : {num_input_ssr}
-Number of primers : {num_primers}
-SSRs with primers : {len(ssrs)}
+Input SSRs              : {num_input_ssr}
+Number of primers       : {num_primers}
+SSRs with primers       : {len(ssrs)}
+Regions without primers : {num_input_ssr - len(ssrs)}
 """)
 
 
@@ -687,6 +704,7 @@ def _amplify(a_data, proj):
     proj.write_text(os.path.join(a_data.amplify_dir, 'report.txt'), f"""REPORT
 
 Blast results            : {num_blast_results}
+One amplification        : {len(ampl_res)}
 
 More amplifications      : {more_amplifications}
 One wrong amplifications : {one_wrong_amplifications}
@@ -768,6 +786,10 @@ def _finalize(proj):
         final_primers.append((_calc_score(ssr, primer, amp), ssr, primer, amp))
     #
     proj.write_results(final_primers)
+    proj.write_text('report.txt', f"""REPORT
+
+Final results            : {len(final_primers)}
+""")
 
 
 # -------------------------------------------------------------------
@@ -886,7 +908,7 @@ if __name__ == '__main__':
         help='How many bps can RepeatMasker repeat be longer than MISA repeat')
 
     # Primer3 params
-    parser.add_argument('--primer3-num-return', type=int, default=2, help="Primer3: PRIMER_NUM_RETURN")
+    parser.add_argument('--primer3-num-return', type=int, default=1, help="Primer3: PRIMER_NUM_RETURN")
     parser.add_argument('--product-size-range', default='100-250', help="Primer3: PRIMER_PRODUCT_SIZE_RANGE")
     parser.add_argument('--min-size', type=int, default=19, help="Primer3: PRIMER_MIN_SIZE")
     parser.add_argument('--max-size', type=int, default=23, help="Primer3: PRIMER_MAX_SIZE")
